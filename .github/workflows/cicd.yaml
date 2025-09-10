@@ -36,23 +36,24 @@ jobs:
 
     - name: Download dependencies
       run: |
-        cd backend
         go mod download
         go mod verify
 
+    - name: Run tests
+      run: |
+        go test -v ./...
+
     - name: Run go vet
       run: |
-        cd backend
         go vet ./...
 
-    - name: Build backend
+    - name: Build proxy
       run: |
-        cd backend
-        go build -v ./...
+        go build -v -o watchtower-proxy .
 
 
-  build-and-push-backend:
-    needs: test-backend
+  build-and-push-proxy:
+    needs: test-proxy
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
 
@@ -80,11 +81,11 @@ jobs:
           type=sha,prefix={{branch}}-
           type=raw,value=latest,enable={{is_default_branch}}
 
-    - name: Build and push backend
+    - name: Build and push proxy
       uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
       with:
-        context: ./backend
-        file: ./backend/Dockerfile
+        context: .
+        file: ./Dockerfile
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}

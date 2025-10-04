@@ -94,19 +94,20 @@ func main() {
 		}
 		log.Printf("DEBUG: Webhook ID validated successfully")
 
-		// Read and parse request body to check tag if needed
+		// Read request body once
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("ERROR: Failed to read request body: %v", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		// Check tag validation if enabled
 		var shouldForward = true
 		var payload DockerHubPayload
 
 		if watchOnly {
-			log.Printf("DEBUG: Tag validation enabled - reading request body")
-
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				log.Printf("ERROR: Failed to read request body: %v", err)
-				http.Error(w, "Bad Request", http.StatusBadRequest)
-				return
-			}
+			log.Printf("DEBUG: Tag validation enabled - parsing request body")
 
 			// Parse JSON payload
 			if err := json.Unmarshal(body, &payload); err != nil {
@@ -134,94 +135,89 @@ func main() {
 				w.Write([]byte(`{"message":"Webhook received but not forwarded - tag is not latest","tag":"` + tag + `"}`))
 				return
 			} else {
-				log.Printf("DEBUG: Tag is 'latest' - will forward webhook after delay")
+				log.Printf("DEBUG: Tag is 'latest' - will forward webhook asynchronously")
 			}
-
-			// Recreate the request body for forwarding
-			r.Body = io.NopCloser(strings.NewReader(string(body)))
 		}
 
-		if !shouldForward {
-			log.Printf("DEBUG: Webhook not forwarded due to tag validation")
-			return
-		}
-
-		// Add delay before forwarding
-		log.Printf("DEBUG: Starting %d second delay before forwarding webhook", delaySeconds)
-		time.Sleep(time.Duration(delaySeconds) * time.Second)
-		log.Printf("DEBUG: Delay completed - now forwarding webhook to Watchtower")
-
-		// Create request to Watchtower
-		client := &http.Client{
-			Timeout: 30 * time.Second,
-		}
-
-		// Build the full Watchtower URL
-		watchtowerFullURL := watchtowerURL + "/v1/update"
-		log.Printf("DEBUG: Forwarding to Watchtower endpoint: %s", watchtowerFullURL)
-
-		req, err := http.NewRequest("POST", watchtowerFullURL, r.Body)
-		if err != nil {
-			log.Printf("ERROR: Failed to create request: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		// Add authorization header
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		log.Printf("DEBUG: Added Authorization header and Content-Type")
-
-		// Forward original request headers (optional)
+		// Copy headers we want to forward
+		headersToForward := make(map[string][]string)
 		for name, values := range r.Header {
 			if strings.ToLower(name) != "authorization" {
-				req.Header[name] = values
+				headersToForward[name] = values
 			}
 		}
 
-		log.Printf("DEBUG: Executing request to Watchtower...")
+		// Respond immediately with 201 Accepted
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"message":"Webhook received and queued for processing","webhook_id":"` + id + `"}`))
+		log.Printf("DEBUG: Responded with 201 - processing webhook asynchronously")
 
-		// Execute request
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("ERROR: Failed to forward request to Watchtower: %v", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
+		// Process webhook asynchronously if it should be forwarded
+		if shouldForward {
+			go func() {
+				// Add delay before forwarding
+				log.Printf("DEBUG: Starting %d second delay before forwarding webhook", delaySeconds)
+				time.Sleep(time.Duration(delaySeconds) * time.Second)
+				log.Printf("DEBUG: Delay completed - now forwarding webhook to Watchtower")
 
-		// Log response details for debugging
-		log.Printf("DEBUG: Watchtower response - Status: %d, Headers: %v", resp.StatusCode, resp.Header)
+				// Create request to Watchtower
+				client := &http.Client{
+					Timeout: 30 * time.Second,
+				}
 
-		// If we get a 404, provide helpful guidance
-		if resp.StatusCode == 404 {
-			log.Printf("ERROR: 404 - Watchtower endpoint not found. Current URL: %s", watchtowerFullURL)
-			log.Printf("DEBUG: Common Watchtower endpoints to try: /v1/update, /api/update, /webhook")
-		}
+				// Build the full Watchtower URL
+				watchtowerFullURL := watchtowerURL + "/v1/update"
+				log.Printf("DEBUG: Forwarding to Watchtower endpoint: %s", watchtowerFullURL)
 
-		// Read response body for logging
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("ERROR: Failed to read response body: %v", err)
-		} else {
-			log.Printf("DEBUG: Watchtower response body: %s", string(respBody))
-		}
+				req, err := http.NewRequest("POST", watchtowerFullURL, strings.NewReader(string(body)))
+				if err != nil {
+					log.Printf("ERROR: Failed to create request: %v", err)
+					return
+				}
 
-		// Copy response headers
-		for name, values := range resp.Header {
-			w.Header()[name] = values
-		}
+				// Add authorization header
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+				req.Header.Set("Content-Type", "application/json")
+				log.Printf("DEBUG: Added Authorization header and Content-Type")
 
-		// Set status code
-		w.WriteHeader(resp.StatusCode)
+				// Forward original request headers
+				for name, values := range headersToForward {
+					req.Header[name] = values
+				}
 
-		// Write response body
-		w.Write(respBody)
+				log.Printf("DEBUG: Executing request to Watchtower...")
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			log.Printf("SUCCESS: Webhook %s forwarded to Watchtower successfully - Status: %d", id, resp.StatusCode)
-		} else {
-			log.Printf("WARNING: Webhook %s forwarded but got non-success status: %d", id, resp.StatusCode)
+				// Execute request
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("ERROR: Failed to forward request to Watchtower: %v", err)
+					return
+				}
+				defer resp.Body.Close()
+
+				// Log response details for debugging
+				log.Printf("DEBUG: Watchtower response - Status: %d, Headers: %v", resp.StatusCode, resp.Header)
+
+				// If we get a 404, provide helpful guidance
+				if resp.StatusCode == 404 {
+					log.Printf("ERROR: 404 - Watchtower endpoint not found. Current URL: %s", watchtowerFullURL)
+					log.Printf("DEBUG: Common Watchtower endpoints to try: /v1/update, /api/update, /webhook")
+				}
+
+				// Read response body for logging
+				respBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					log.Printf("ERROR: Failed to read response body: %v", err)
+				} else {
+					log.Printf("DEBUG: Watchtower response body: %s", string(respBody))
+				}
+
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					log.Printf("SUCCESS: Webhook %s forwarded to Watchtower successfully - Status: %d", id, resp.StatusCode)
+				} else {
+					log.Printf("WARNING: Webhook %s forwarded but got non-success status: %d", id, resp.StatusCode)
+				}
+			}()
 		}
 	}).Methods("POST")
 
